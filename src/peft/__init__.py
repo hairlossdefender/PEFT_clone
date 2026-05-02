@@ -112,6 +112,8 @@ from .tuners import (
     PsoftModel,
     PveraConfig,
     PveraModel,
+    GloftConfig,
+    GloftModel,
     RandLoraConfig,
     RandLoraModel,
     RoadConfig,
@@ -157,7 +159,6 @@ from .utils import (
     set_peft_model_state_dict,
     shift_tokens_right,
 )
-
 
 __all__ = [
     "MODEL_TYPE_TO_PEFT_MODEL_MAPPING",
@@ -250,6 +251,8 @@ __all__ = [
     "PsoftModel",
     "PveraConfig",
     "PveraModel",
+    "GloftConfig",
+    "GloftModel",
     "RandLoraConfig",
     "RandLoraModel",
     "RoadConfig",

@@ -51,6 +51,7 @@ from peft import (
     PromptEncoderConfig,
     PromptTuningConfig,
     PsoftConfig,
+    GloftConfig,
     RoadConfig,
     ShiraConfig,
     TaskType,
@@ -60,7 +61,6 @@ from peft import (
     VeraConfig,
     XLoraConfig,
 )
-
 
 PEFT_MODELS_TO_TEST = [("peft-internal-testing/tiny-opt-lora-revision", "test")]
 
@@ -90,6 +90,7 @@ ALL_CONFIG_CLASSES = (
     (PromptEncoderConfig, {}),
     (PromptTuningConfig, {}),
     (PsoftConfig, {}),
+    (GloftConfig, {}),
     (PeanutConfig, {}),
     (RoadConfig, {}),
     (ShiraConfig, {}),

@@ -57,6 +57,7 @@ from .prefix_tuning import PrefixEncoder, PrefixTuningConfig
 from .prompt_tuning import PromptEmbedding, PromptTuningConfig, PromptTuningInit
 from .psoft import PsoftConfig, PsoftModel
 from .pvera import PveraConfig, PveraModel
+from .gloft import GloftConfig, GloftModel
 from .randlora import RandLoraConfig, RandLoraModel
 from .road import RoadConfig, RoadModel
 from .shira import ShiraConfig, ShiraModel
@@ -66,7 +67,6 @@ from .vblora import VBLoRAConfig, VBLoRAModel
 from .vera import VeraConfig, VeraModel
 from .waveft import WaveFTConfig, WaveFTModel
 from .xlora import XLoraConfig, XLoraModel
-
 
 __all__ = [
     "AdaLoraConfig",
@@ -136,6 +136,9 @@ __all__ = [
     "PsoftConfig",
     "PsoftModel",
     "PveraConfig",
+    "PveraModel",
+    "GloftConfig",
+    "GloftModel",
     "PveraModel",
     "RandLoraConfig",
     "RandLoraModel",

@@ -90,6 +90,7 @@ class PeftType(str, enum.Enum):
     CARTRIDGE = "CARTRIDGE"
     TINYLORA = "TINYLORA"
     PSOFT = "PSOFT"
+    GLOFT = "GLOFT"
     PEANUT = "PEANUT"
 
 
