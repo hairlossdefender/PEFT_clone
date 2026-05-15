@@ -19,6 +19,7 @@ from typing import Any, Optional
 from torch import nn
 
 from peft.tuners.tuners_utils import BaseTuner, get_device_map
+from peft.utils import TRANSFORMERS_MODELS_TO_PSOFT_TARGET_MODULES_MAPPING
 
 from .config import GloftConfig
 from .layer import GloftLayer, dispatch_default
@@ -27,7 +28,7 @@ from .layer import GloftLayer, dispatch_default
 class GloftModel(BaseTuner):
     prefix: str = "gloft_"
     tuner_layer_cls = GloftLayer
-    target_module_mapping: dict[str, list[str]] = {}
+    target_module_mapping = TRANSFORMERS_MODELS_TO_PSOFT_TARGET_MODULES_MAPPING
 
     def _create_and_replace(
         self,
