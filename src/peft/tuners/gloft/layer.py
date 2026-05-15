@@ -208,26 +208,29 @@ class GloftLayer(BaseTunerLayer):
             return result
 
         original_dtype = result.dtype
-        out = result.float()
+        out = result
+
+        device = out.device
+        compute_dtype = self._get_compute_dtype(device, original_dtype)
 
         for active_adapter in self.active_adapters:
             if active_adapter not in self.gloft_A:
                 continue
 
-            A = self.gloft_A[active_adapter].to(device=out.device, dtype=torch.float32)
-            B = self.gloft_B[active_adapter].to(device=out.device, dtype=torch.float32)
-            diag_pre = self.gloft_diag_pre[active_adapter].to(device=out.device, dtype=torch.float32)
-            diag_post = self.gloft_diag_post[active_adapter].to(device=out.device, dtype=torch.float32)
+            A = self.gloft_A[active_adapter].to(device=device, dtype=compute_dtype)
+            B = self.gloft_B[active_adapter].to(device=device, dtype=compute_dtype)
+            diag_pre = self.gloft_diag_pre[active_adapter].to(device=device, dtype=compute_dtype)
+            diag_post = self.gloft_diag_post[active_adapter].to(device=device, dtype=compute_dtype)
 
             r = self.r[active_adapter]
             U = torch.cat([A, B], dim=1)
             V = torch.cat([B, -A], dim=1)
 
-            eye = torch.eye(2 * r, device=out.device, dtype=torch.float32)
+            eye = torch.eye(2 * r, device=device, dtype=compute_dtype)
             M = eye + V.t() @ U
             Z = torch.linalg.solve(M, V.t())
 
-            out_pre = out * diag_pre
+            out_pre = out.to(dtype=compute_dtype) * diag_pre
             temp = out_pre @ Z.t()
             out_rot = out_pre - 2.0 * temp @ U.t()
             out = out_rot * diag_post
