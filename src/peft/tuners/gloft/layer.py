@@ -109,6 +109,12 @@ class GloftLayer(BaseTunerLayer):
     def _get_compute_dtype(self, device: torch.device, out_dtype: torch.dtype) -> torch.dtype:
         return torch.float32 if (device.type == "cpu" and out_dtype in (torch.float16, torch.bfloat16)) else out_dtype
 
+    def _solve_dtype(self, device: torch.device, dtype: torch.dtype) -> torch.dtype:
+        # CUDA lu_factor does not support fp16/bf16; solve in fp32 then cast back.
+        if device.type == "cuda" and dtype in (torch.float16, torch.bfloat16):
+            return torch.float32
+        return dtype
+
     def update_layer(self, adapter_name: str, config: GloftConfig, **kwargs: Any) -> None:
         r = int(config.r)
         self.r[adapter_name] = r
@@ -145,7 +151,8 @@ class GloftLayer(BaseTunerLayer):
         V = torch.cat([B, -A], dim=1)
         eye = torch.eye(2 * r, device=device, dtype=compute_dtype)
         M = eye + V.t() @ U
-        Z = torch.linalg.solve(M, V.t())
+        solve_dtype = self._solve_dtype(device, compute_dtype)
+        Z = torch.linalg.solve(M.to(solve_dtype), V.t().to(solve_dtype)).to(compute_dtype)
         K = torch.eye(self.out_features, device=device, dtype=compute_dtype) - 2.0 * Z.t() @ U.t()
 
         W = weight.to(device=device, dtype=compute_dtype)
@@ -228,7 +235,8 @@ class GloftLayer(BaseTunerLayer):
 
             eye = torch.eye(2 * r, device=device, dtype=compute_dtype)
             M = eye + V.t() @ U
-            Z = torch.linalg.solve(M, V.t())
+            solve_dtype = self._solve_dtype(device, compute_dtype)
+            Z = torch.linalg.solve(M.to(solve_dtype), V.t().to(solve_dtype)).to(compute_dtype)
 
             out_pre = out.to(dtype=compute_dtype) * diag_pre
             temp = out_pre @ Z.t()
