@@ -67,3 +67,19 @@ class GloftModel(BaseTuner):
         if new_module is None:
             raise ValueError("Target module is not supported by GLOFT. Only torch.nn.Linear is supported.")
         return new_module
+
+    def _post_injection_hook(self, model: nn.Module, config: GloftConfig, adapter_name: str) -> None:
+        # Module.to() during injection can replace parameters and turn gradients
+        # back on, so the freeze is applied again after the adapter is in place.
+        if not getattr(config, "freeze_diag", False):
+            return
+        for module in model.modules():
+            if not isinstance(module, GloftLayer):
+                continue
+            for name in ("gloft_diag_pre", "gloft_diag_post"):
+                bank = getattr(module, name)
+                if adapter_name not in bank:
+                    continue
+                param = bank[adapter_name]
+                param.requires_grad_(False)
+                param.fill_(1)

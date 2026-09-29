@@ -132,15 +132,17 @@ class GloftLayer(BaseTunerLayer):
             init_method=config.init_method,
             init_scale=config.init_scale,
         )
+        if getattr(config, "freeze_diag", False):
+            # Ones with requires_grad left on would still train, and PEFT's
+            # adapter marking does not turn a frozen parameter back on.
+            for name in ("gloft_diag_pre", "gloft_diag_post"):
+                param = getattr(self, name)[adapter_name]
+                param.requires_grad_(False)
+                param.fill_(1)
         self.set_adapter([adapter_name])
 
-    def get_delta_weight(self, adapter_name: str) -> torch.Tensor:
-        base_layer = self.get_base_layer()
-        weight = base_layer.weight
-        device = weight.device
-        out_dtype = weight.dtype
-        compute_dtype = self._get_compute_dtype(device, out_dtype)
-
+    def _transform_matrix(self, adapter_name: str, device: torch.device, compute_dtype: torch.dtype):
+        """Return (K, diag_pre, diag_post) for y = diag_post * (K @ (diag_pre * z))."""
         A = self.gloft_A[adapter_name].to(device=device, dtype=compute_dtype)
         B = self.gloft_B[adapter_name].to(device=device, dtype=compute_dtype)
         diag_pre = self.gloft_diag_pre[adapter_name].to(device=device, dtype=compute_dtype)
@@ -153,28 +155,62 @@ class GloftLayer(BaseTunerLayer):
         M = eye + V.t() @ U
         solve_dtype = self._solve_dtype(device, compute_dtype)
         Z = torch.linalg.solve(M.to(solve_dtype), V.t().to(solve_dtype)).to(compute_dtype)
-        K = torch.eye(self.out_features, device=device, dtype=compute_dtype) - 2.0 * Z.t() @ U.t()
+        # forward applies `out_pre @ (I - 2 Z^T U^T)` to row vectors, which is
+        # `(I - 2 U Z) @ out_pre` in column form. U Z is not symmetric, so the
+        # column-form matrix used for merging must not be transposed.
+        K = torch.eye(self.out_features, device=device, dtype=compute_dtype) - 2.0 * U @ Z
+        return K, diag_pre, diag_post
+
+    def get_delta_weight(self, adapter_name: str) -> torch.Tensor:
+        base_layer = self.get_base_layer()
+        weight = base_layer.weight
+        device = weight.device
+        out_dtype = weight.dtype
+        compute_dtype = self._get_compute_dtype(device, out_dtype)
+
+        K, diag_pre, diag_post = self._transform_matrix(adapter_name, device, compute_dtype)
 
         W = weight.to(device=device, dtype=compute_dtype)
         W_transformed = diag_post[:, None] * (K @ (diag_pre[:, None] * W))
         delta = W_transformed - W
         return delta.to(dtype=out_dtype)
 
+    def get_delta_bias(self, adapter_name: str) -> Optional[torch.Tensor]:
+        """Bias delta for merging.
+
+        The GLOFT transform acts on the base layer's *output*, so it rotates
+        `Wx + b` as a whole. Merging only the weight would leave `b` unrotated
+        and give a merged layer that disagrees with `forward` on any biased
+        Linear (attention projections and MLPs in ViT-family backbones).
+        """
+        bias = self.get_base_layer().bias
+        if bias is None:
+            return None
+        device = bias.device
+        out_dtype = bias.dtype
+        compute_dtype = self._get_compute_dtype(device, out_dtype)
+
+        K, diag_pre, diag_post = self._transform_matrix(adapter_name, device, compute_dtype)
+
+        b = bias.to(device=device, dtype=compute_dtype)
+        b_transformed = diag_post * (K @ (diag_pre * b))
+        return (b_transformed - b).to(dtype=out_dtype)
+
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         adapter_names = check_adapters_to_merge(self, adapter_names)
         if not adapter_names:
             return
 
-        base_layer = self.get_base_layer()
-
         for active_adapter in adapter_names:
             if active_adapter not in self.gloft_A:
                 continue
 
-            delta_weight = self.get_delta_weight(active_adapter)
             base_layer = self.get_base_layer()
             orig_dtype = base_layer.weight.data.dtype
-            merged_delta = delta_weight.to(orig_dtype).detach().clone()
+            merged_delta = self.get_delta_weight(active_adapter).to(orig_dtype).detach().clone()
+            bias_delta = self.get_delta_bias(active_adapter)
+            if bias_delta is not None:
+                bias_delta = bias_delta.to(base_layer.bias.data.dtype).detach().clone()
 
             if safe_merge:
                 output_weight = base_layer.weight.data.clone()
@@ -184,25 +220,38 @@ class GloftLayer(BaseTunerLayer):
                         f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
                     )
                 base_layer.weight.data = output_weight
+                if bias_delta is not None:
+                    output_bias = base_layer.bias.data.clone() + bias_delta
+                    if not torch.isfinite(output_bias).all():
+                        raise ValueError(
+                            f"NaNs detected in the merged bias. The adapter {active_adapter} seems to be broken"
+                        )
+                    base_layer.bias.data = output_bias
             else:
                 base_layer.weight.data += merged_delta
+                if bias_delta is not None:
+                    base_layer.bias.data += bias_delta
 
-            self._merged_deltas[active_adapter] = merged_delta
+            self._merged_deltas[active_adapter] = (merged_delta, bias_delta)
             self.merged_adapters.append(active_adapter)
 
     def unmerge(self) -> None:
         if not self.merged:
             return
 
-        weight = self.get_base_layer().weight
+        base_layer = self.get_base_layer()
+        weight = base_layer.weight
 
         while len(self.merged_adapters) > 0:
             active_adapter = self.merged_adapters.pop()
-            merged_delta = self._merged_deltas.pop(active_adapter, None)
-            if merged_delta is None:
+            deltas = self._merged_deltas.pop(active_adapter, None)
+            if deltas is None:
                 continue
 
+            merged_delta, bias_delta = deltas
             weight.data -= merged_delta.to(weight.dtype)
+            if bias_delta is not None:
+                base_layer.bias.data -= bias_delta.to(base_layer.bias.dtype)
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         if self.disable_adapters:

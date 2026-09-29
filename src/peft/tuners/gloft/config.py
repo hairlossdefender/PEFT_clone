@@ -69,6 +69,15 @@ class GloftConfig(PeftConfig):
         default=0.01,
         metadata={"help": "Scale used for random initialization when init_method uses a normal distribution."},
     )
+    freeze_diag: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Keep gloft_diag_pre and gloft_diag_post at 1 and out of the optimizer, "
+                "so the adapter is the rotation alone."
+            )
+        },
+    )
     modules_to_save: Optional[list[str]] = field(
         default=None,
         metadata={"help": "List of modules apart from GLOFT layers to save in the final checkpoint."},
