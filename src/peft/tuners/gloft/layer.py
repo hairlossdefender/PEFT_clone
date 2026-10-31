@@ -31,8 +31,9 @@ class GloftLayer(BaseTunerLayer):
         "gloft_B",
         "gloft_diag_pre",
         "gloft_diag_post",
+        "gloft_theta",
     )
-    other_param_names: tuple[str, ...] = ("r", "init_weights")
+    other_param_names: tuple[str, ...] = ("r", "init_weights", "constraint", "generator", "init_mode")
 
     def __init__(self, base_layer: nn.Module, **kwargs: Any) -> None:
         super().__init__()
@@ -40,11 +41,16 @@ class GloftLayer(BaseTunerLayer):
 
         self.r: dict[str, int] = {}
         self.init_weights: dict[str, bool] = {}
+        # factorial-study options (defaults reproduce the original GLOFT exactly)
+        self.constraint: dict[str, str] = {}
+        self.generator: dict[str, str] = {}
+        self.init_mode: dict[str, str] = {}
 
         self.gloft_A = nn.ParameterDict({})
         self.gloft_B = nn.ParameterDict({})
         self.gloft_diag_pre = nn.ParameterDict({})
         self.gloft_diag_post = nn.ParameterDict({})
+        self.gloft_theta = nn.ParameterDict({})  # per-plane angles, generator="angle" only
 
         self.merged_adapters: list[str] = []
         self._merged_deltas: dict[str, torch.Tensor] = {}
@@ -119,6 +125,9 @@ class GloftLayer(BaseTunerLayer):
         r = int(config.r)
         self.r[adapter_name] = r
         self.init_weights[adapter_name] = config.init_weights
+        self.constraint[adapter_name] = getattr(config, "constraint", "cayley")
+        self.generator[adapter_name] = getattr(config, "generator", "factored")
+        self.init_mode[adapter_name] = getattr(config, "init_mode", "random")
 
         self.gloft_A[adapter_name] = nn.Parameter(torch.empty(self.out_features, r))
         self.gloft_B[adapter_name] = nn.Parameter(torch.empty(self.out_features, r))
@@ -132,6 +141,13 @@ class GloftLayer(BaseTunerLayer):
             init_method=config.init_method,
             init_scale=config.init_scale,
         )
+        if self.generator[adapter_name] == "angle":
+            # Directions come from A, B (normalised columns); angles start at 0, so K = I exactly.
+            self.gloft_theta[adapter_name] = nn.Parameter(torch.zeros(r, dtype=self.gloft_A[adapter_name].dtype))
+        elif self.init_mode[adapter_name] == "identity":
+            # A = 0 -> S = 0 -> K = I. dL/dA = (G - G^T) B != 0, so training still starts.
+            with torch.no_grad():
+                self.gloft_A[adapter_name].zero_()
         if getattr(config, "freeze_diag", False):
             # Ones with requires_grad left on would still train, and PEFT's
             # adapter marking does not turn a frozen parameter back on.
@@ -141,20 +157,40 @@ class GloftLayer(BaseTunerLayer):
                 param.fill_(1)
         self.set_adapter([adapter_name])
 
-    def _transform_matrix(self, adapter_name: str, device: torch.device, compute_dtype: torch.dtype):
-        """Return (K, diag_pre, diag_post) for y = diag_post * (K @ (diag_pre * z))."""
+    def _lowrank_factors(self, adapter_name: str, device: torch.device, compute_dtype: torch.dtype):
+        """Return (U, Z) with K = I - 2 U Z for every (constraint, generator) combination.
+
+        constraint  cayley: K = (I - S)(I + S)^-1, S = A B^T - B A^T   (exact rotation; original GLOFT)
+                    linear: K = I - 2 S                                 (first-order Cayley, not orthogonal)
+                    free:   K = I - 2 A B^T                             (no skew constraint, same parameters)
+        generator   factored: A, B as stored (original GLOFT)
+                    angle:    A <- normalize(A) * theta, B <- normalize(B)  (direction / angle decoupled)
+        """
         A = self.gloft_A[adapter_name].to(device=device, dtype=compute_dtype)
         B = self.gloft_B[adapter_name].to(device=device, dtype=compute_dtype)
-        diag_pre = self.gloft_diag_pre[adapter_name].to(device=device, dtype=compute_dtype)
-        diag_post = self.gloft_diag_post[adapter_name].to(device=device, dtype=compute_dtype)
-        r = self.r[adapter_name]
-
+        if self.generator.get(adapter_name, "factored") == "angle":
+            theta = self.gloft_theta[adapter_name].to(device=device, dtype=compute_dtype)
+            A = A / A.norm(dim=0, keepdim=True).clamp_min(1e-12) * theta
+            B = B / B.norm(dim=0, keepdim=True).clamp_min(1e-12)
+        constraint = self.constraint.get(adapter_name, "cayley")
+        if constraint == "free":
+            return A, B.t()
         U = torch.cat([A, B], dim=1)
         V = torch.cat([B, -A], dim=1)
+        if constraint == "linear":
+            return U, V.t()
+        r = self.r[adapter_name]
         eye = torch.eye(2 * r, device=device, dtype=compute_dtype)
         M = eye + V.t() @ U
         solve_dtype = self._solve_dtype(device, compute_dtype)
         Z = torch.linalg.solve(M.to(solve_dtype), V.t().to(solve_dtype)).to(compute_dtype)
+        return U, Z
+
+    def _transform_matrix(self, adapter_name: str, device: torch.device, compute_dtype: torch.dtype):
+        """Return (K, diag_pre, diag_post) for y = diag_post * (K @ (diag_pre * z))."""
+        diag_pre = self.gloft_diag_pre[adapter_name].to(device=device, dtype=compute_dtype)
+        diag_post = self.gloft_diag_post[adapter_name].to(device=device, dtype=compute_dtype)
+        U, Z = self._lowrank_factors(adapter_name, device, compute_dtype)
         # forward applies `out_pre @ (I - 2 Z^T U^T)` to row vectors, which is
         # `(I - 2 U Z) @ out_pre` in column form. U Z is not symmetric, so the
         # column-form matrix used for merging must not be transposed.
@@ -273,19 +309,9 @@ class GloftLayer(BaseTunerLayer):
             if active_adapter not in self.gloft_A:
                 continue
 
-            A = self.gloft_A[active_adapter].to(device=device, dtype=compute_dtype)
-            B = self.gloft_B[active_adapter].to(device=device, dtype=compute_dtype)
             diag_pre = self.gloft_diag_pre[active_adapter].to(device=device, dtype=compute_dtype)
             diag_post = self.gloft_diag_post[active_adapter].to(device=device, dtype=compute_dtype)
-
-            r = self.r[active_adapter]
-            U = torch.cat([A, B], dim=1)
-            V = torch.cat([B, -A], dim=1)
-
-            eye = torch.eye(2 * r, device=device, dtype=compute_dtype)
-            M = eye + V.t() @ U
-            solve_dtype = self._solve_dtype(device, compute_dtype)
-            Z = torch.linalg.solve(M.to(solve_dtype), V.t().to(solve_dtype)).to(compute_dtype)
+            U, Z = self._lowrank_factors(active_adapter, device, compute_dtype)
 
             out_pre = out.to(dtype=compute_dtype) * diag_pre
             temp = out_pre @ Z.t()

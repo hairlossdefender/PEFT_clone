@@ -42,17 +42,38 @@ class OrthLayer(nn.Module):
         use_cayley_neumann: bool = False,
         num_cayley_neumann_terms: int = 5,
         cayley_neumann_eps: Optional[float] = None,
+        generator: str = "dense",
+        constraint: str = "cayley",
+        gen_rank: Optional[int] = None,
+        gen_init: str = "identity",
+        gen_init_scale: float = 0.01,
     ):
         super().__init__()
         self.size = size
         self.orth = orth
+        # Factorial-ablation options (see PsoftConfig). Defaults reproduce the original PSOFT exactly.
+        self.generator = generator
+        self.constraint = constraint
+        self.gen_rank = gen_rank
+        self.gen_init = gen_init
+        self.gen_init_scale = gen_init_scale
         self.mag_b = mag_b
         self.mag_a = mag_a
         self.use_cayley_neumann = use_cayley_neumann
         self.num_cayley_neumann_terms = num_cayley_neumann_terms
         self.cayley_neumann_eps = cayley_neumann_eps
 
-        if orth:
+        if orth and generator != "dense":
+            # low-rank generator G = A B^T (- B A^T); "angle" adds per-plane angles over unit directions
+            k = int(gen_rank)
+            self.weight = None
+            self.gen_A = nn.Parameter(torch.empty(size, k))
+            self.gen_B = nn.Parameter(torch.empty(size, k))
+            self.gen_theta = nn.Parameter(torch.empty(k)) if generator == "angle" else None
+        elif orth and constraint == "free":
+            # dense unconstrained generator, R = I + 2 M (M is a full r x r matrix)
+            self.weight = nn.Parameter(torch.empty(size, size))
+        elif orth:
             self.weight = nn.Parameter(torch.empty((size * (size - 1)) // 2))
             rows, cols = torch.triu_indices(size, size, 1)
             self.register_buffer("rows", rows, persistent=False)
@@ -63,17 +84,40 @@ class OrthLayer(nn.Module):
         self.vector_b = nn.Parameter(torch.empty(size)) if mag_b else None
         self.vector_a = nn.Parameter(torch.empty(size)) if mag_a else None
 
+    def _is_variant(self) -> bool:
+        return self.orth and (self.generator != "dense" or self.constraint != "cayley" or self.gen_init != "identity")
+
+    def _reset_generator(self, identity: bool) -> None:
+        s = self.gen_init_scale
+        if self.generator == "dense":
+            if identity:
+                self.weight.zero_()
+            else:
+                nn.init.normal_(self.weight, mean=0.0, std=s)
+            return
+        nn.init.normal_(self.gen_A, mean=0.0, std=s)
+        nn.init.normal_(self.gen_B, mean=0.0, std=s)
+        if self.generator == "angle":
+            if identity:
+                self.gen_theta.zero_()
+            else:
+                nn.init.normal_(self.gen_theta, mean=0.0, std=s)
+        elif identity:
+            self.gen_A.zero_()  # G = 0 but both factors still receive gradients (through B)
+
     def reset_parameters(self, init_weights: bool = True) -> None:
-        params = [self.weight]
-        if self.vector_b is not None:
-            params.append(self.vector_b)
-        if self.vector_a is not None:
-            params.append(self.vector_a)
+        params = list(self.parameters())
 
         if any(p.is_meta for p in params):
             return
 
         with torch.no_grad():
+            if self._is_variant():
+                self._reset_generator(identity=init_weights and self.gen_init == "identity")
+                for vec in (self.vector_b, self.vector_a):
+                    if vec is not None:
+                        vec.fill_(1.0)
+                return
             if init_weights:
                 if self.orth:
                     self.weight.zero_()
@@ -113,6 +157,17 @@ class OrthLayer(nn.Module):
         Q = Q.index_put((self.rows, self.cols), self.weight)
         return Q - Q.transpose(0, 1)
 
+    def _generator(self) -> torch.Tensor:
+        """r x r generator. Skew-symmetric unless constraint == 'free'."""
+        if self.generator == "dense":
+            return self.weight if self.constraint == "free" else self._skew_symmetric()
+        A, B = self.gen_A, self.gen_B
+        if self.generator == "angle":
+            A = A / A.norm(dim=0, keepdim=True).clamp_min(1e-12) * self.gen_theta
+            B = B / B.norm(dim=0, keepdim=True).clamp_min(1e-12)
+        G = A @ B.t()
+        return G if self.constraint == "free" else G - G.t()
+
     # Adapted from the Cayley/Neumann-based orthogonal parametrization used in OFT v2
     # (PEFT implementation: https://github.com/huggingface/peft/blob/main/src/peft/tuners/oft/layer.py) #L160
     def _project_Q(self, Q: torch.Tensor, eps: float = 0.9) -> torch.Tensor:
@@ -129,12 +184,16 @@ class OrthLayer(nn.Module):
         if not self.orth:
             R = self.weight
         else:
-            Q = self._skew_symmetric()
+            Q = self._generator()
             orig_dtype = Q.dtype
 
             id_mat = torch.eye(self.size, device=Q.device, dtype=Q.dtype)
 
-            if self.use_cayley_neumann:
+            if self.constraint != "cayley":
+                # first-order Cayley, R = I + 2Q: orthogonal only to first order ("linear"),
+                # or not at all when Q is a general matrix ("free")
+                R = id_mat + 2.0 * Q
+            elif self.use_cayley_neumann:
                 if self.cayley_neumann_eps is not None:
                     Q = self._project_Q(Q, eps=self.cayley_neumann_eps)
                 t = int(self.num_cayley_neumann_terms)
@@ -177,7 +236,9 @@ class OrthLayer(nn.Module):
             f"use_cayley_neumann={self.use_cayley_neumann}, "
             f"num_cayley_neumann_terms={int(self.num_cayley_neumann_terms)}, "
             f"cayley_neumann_eps={self.cayley_neumann_eps}, "
-            f"mag_a={self.mag_a}, mag_b={self.mag_b}"
+            f"mag_a={self.mag_a}, mag_b={self.mag_b}, "
+            f"generator={self.generator}, constraint={self.constraint}, gen_rank={self.gen_rank}, "
+            f"gen_init={self.gen_init}"
             f")"
         )
 
@@ -260,6 +321,11 @@ class PsoftLayer(BaseTunerLayer):
             use_cayley_neumann=config.use_cayley_neumann,
             num_cayley_neumann_terms=config.num_cayley_neumann_terms,
             cayley_neumann_eps=config.cayley_neumann_eps,
+            generator=getattr(config, "psoft_generator", "dense"),
+            constraint=getattr(config, "psoft_constraint", "cayley"),
+            gen_rank=getattr(config, "psoft_gen_rank", None),
+            gen_init=getattr(config, "psoft_gen_init", "identity"),
+            gen_init_scale=getattr(config, "psoft_gen_init_scale", 0.01),
         )
 
         self._move_adapter_to_device_of_base_layer(adapter_name)

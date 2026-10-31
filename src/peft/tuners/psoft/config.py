@@ -85,6 +85,23 @@ class PsoftConfig(PeftConfig):
             matrix Q in the Cayley-Neumann approximation. If None (default), no rescaling is applied. If set to a value
             in (0, 1) (e.g., 0.9), Q is rescaled whenever ||Q||_F exceeds the threshold to improve numerical stability.
             See https://spherelab.ai/oftv2/ for details.
+        psoft_generator (`Literal["dense", "factored", "angle"]`):
+            Defaults to 'dense' (original PSOFT). Parameterization of the r x r generator Q inside the principal
+            subspace. 'dense': all r(r-1)/2 skew entries. 'factored': Q = A B^T - B A^T with A, B of shape
+            (r, psoft_gen_rank). 'angle': Q = sum_i theta_i (a_i b_i^T - b_i a_i^T) with unit-norm a_i, b_i.
+        psoft_constraint (`Literal["cayley", "linear", "free"]`):
+            Defaults to 'cayley' (original PSOFT). 'cayley': R = (I+Q)(I-Q)^-1, exactly orthogonal. 'linear':
+            R = I + 2Q with the same skew-symmetric Q (orthogonal to first order only). 'free': R = I + 2Q with Q
+            unconstrained (A B^T for factored/angle, a full r x r matrix for dense).
+        psoft_gen_rank (`Optional[int]`):
+            Rank k of the 'factored'/'angle' generator. Defaults to max(1, round((r-1)/4)), which matches the
+            parameter count of the dense generator.
+        psoft_gen_init (`Literal["identity", "random"]`):
+            Defaults to 'identity' (Q = 0, original PSOFT). 'random' starts from a random generator with entries
+            N(0, psoft_gen_init_scale^2), like GLOFT's default init.
+        psoft_gen_init_scale (`float`):
+            Defaults to 0.01. Std of the random generator entries (for 'factored'/'angle' also the std of the
+            factor that is not zeroed under identity init).
         init_weights (`bool`):
             Defaults to 'True'. Whether to initialize the weights of the PSOFT layers with their default
             initialization. Don't change this setting, except if you know exactly what you're doing.
@@ -209,6 +226,26 @@ class PsoftConfig(PeftConfig):
             )
         },
     )
+    psoft_generator: Literal["dense", "factored", "angle"] = field(
+        default="dense",
+        metadata={"help": "Generator parameterization: 'dense' (original), 'factored' (A B^T - B A^T), 'angle'."},
+    )
+    psoft_constraint: Literal["cayley", "linear", "free"] = field(
+        default="cayley",
+        metadata={"help": "'cayley' (exact rotation, original), 'linear' (R = I + 2Q, Q skew), 'free' (R = I + 2Q)."},
+    )
+    psoft_gen_rank: Optional[int] = field(
+        default=None,
+        metadata={"help": "Rank of the factored/angle generator. Default: parameter-matched to dense, round((r-1)/4)."},
+    )
+    psoft_gen_init: Literal["identity", "random"] = field(
+        default="identity",
+        metadata={"help": "'identity' (Q = 0, original) or 'random' (entries N(0, psoft_gen_init_scale^2))."},
+    )
+    psoft_gen_init_scale: float = field(
+        default=0.01,
+        metadata={"help": "Std of the random generator init."},
+    )
     modules_to_save: Optional[list[str]] = field(
         default=None,
         metadata={
@@ -289,6 +326,25 @@ class PsoftConfig(PeftConfig):
                 f"{self.psoft_svd_lowrank_niter} will be ignored.",
                 UserWarning,
             )
+
+        if self.psoft_generator not in ("dense", "factored", "angle"):
+            raise ValueError(f"`psoft_generator` must be dense/factored/angle; got {self.psoft_generator!r}.")
+        if self.psoft_constraint not in ("cayley", "linear", "free"):
+            raise ValueError(f"`psoft_constraint` must be cayley/linear/free; got {self.psoft_constraint!r}.")
+        if self.psoft_gen_init not in ("identity", "random"):
+            raise ValueError(f"`psoft_gen_init` must be identity/random; got {self.psoft_gen_init!r}.")
+        is_variant = (self.psoft_generator, self.psoft_constraint, self.psoft_gen_init) != ("dense", "cayley", "identity")
+        if is_variant and not self.psoft_orth:
+            raise ValueError("psoft_generator/psoft_constraint/psoft_gen_init variants require psoft_orth=True.")
+        if self.psoft_constraint != "cayley" and self.use_cayley_neumann:
+            raise ValueError("`use_cayley_neumann` only applies to psoft_constraint='cayley'.")
+        if self.psoft_generator == "dense":
+            if self.psoft_gen_rank is not None:
+                warnings.warn("`psoft_gen_rank` is ignored for psoft_generator='dense'.", UserWarning)
+        elif self.psoft_gen_rank is None:
+            self.psoft_gen_rank = max(1, round((self.r - 1) / 4))
+        elif not (0 < self.psoft_gen_rank <= self.r):
+            raise ValueError(f"`psoft_gen_rank` must be in [1, r]; got {self.psoft_gen_rank}.")
 
         DEFAULT_NUM_CAYLEY_NEUMANN_TERMS = self.__dataclass_fields__["num_cayley_neumann_terms"].default
         if self.use_cayley_neumann:

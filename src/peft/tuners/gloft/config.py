@@ -78,6 +78,34 @@ class GloftConfig(PeftConfig):
             )
         },
     )
+    constraint: str = field(
+        default="cayley",
+        metadata={
+            "help": (
+                "Factorial-study option. 'cayley' (default): exact rotation K = (I - S)(I + S)^-1. "
+                "'linear': K = I - 2S (first-order Cayley, not orthogonal). "
+                "'free': K = I - 2AB^T (no skew-symmetry, same parameter count)."
+            )
+        },
+    )
+    generator: str = field(
+        default="factored",
+        metadata={
+            "help": (
+                "Factorial-study option. 'factored' (default): S = AB^T - BA^T. "
+                "'angle': unit-norm directions from A, B and a learned angle per plane (starts at 0, K = I)."
+            )
+        },
+    )
+    init_mode: str = field(
+        default="random",
+        metadata={
+            "help": (
+                "'random' (default): A, B ~ init_method, which makes K a random rotation at step 0. "
+                "'identity': A = 0 so K = I at step 0 (B keeps its random init)."
+            )
+        },
+    )
     modules_to_save: Optional[list[str]] = field(
         default=None,
         metadata={"help": "List of modules apart from GLOFT layers to save in the final checkpoint."},
@@ -108,3 +136,11 @@ class GloftConfig(PeftConfig):
             raise ValueError(f"`init_method` must be one of {sorted(allowed_init_methods)}; got {self.init_method!r}.")
         if self.init_scale <= 0:
             raise ValueError(f"`init_scale` must be positive; got {self.init_scale}.")
+        if self.constraint not in {"cayley", "linear", "free"}:
+            raise ValueError(f"`constraint` must be 'cayley', 'linear' or 'free'; got {self.constraint!r}.")
+        if self.generator not in {"factored", "angle"}:
+            raise ValueError(f"`generator` must be 'factored' or 'angle'; got {self.generator!r}.")
+        if self.init_mode not in {"random", "identity"}:
+            raise ValueError(f"`init_mode` must be 'random' or 'identity'; got {self.init_mode!r}.")
+        if self.generator == "angle" and self.init_mode != "identity":
+            raise ValueError("generator='angle' always starts at K = I (angles = 0); set init_mode='identity'.")
